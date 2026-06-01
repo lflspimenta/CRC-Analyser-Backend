@@ -166,7 +166,7 @@ Usa linguagem clara, directa e empática. Evita jargão excessivo. O relatório 
 
     def stream_response():
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         ) as stream:
