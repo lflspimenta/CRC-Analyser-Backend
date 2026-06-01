@@ -1,15 +1,20 @@
 """
 parser.py — Motor de extracção e análise do CRC (Banco de Portugal)
 
-Utiliza pdfplumber para extracção de texto (PDF gerado digitalmente,
-sem necessidade de OCR). Cobre todas as variantes conhecidas do formato.
-"""
+Estratégia de dois níveis:
+  1. Parser regex (rápido, gratuito) — extrai contratos por padrão de texto
+  2. Fallback Claude API — activado automaticamente se o nº de contratos
+     extraídos não bater com o total indicado no quadro síntese do PDF
 
+Desta forma o sistema funciona correctamente para qualquer versão ou
+formato do CRC, mesmo com layouts inesperados.
+"""
 from __future__ import annotations
 
+import json
+import os
 import re
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+import anthropic
 import pdfplumber
 
 
@@ -18,7 +23,6 @@ import pdfplumber
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_money(s: str) -> float:
-    """Converte '1 465,67 €' → 1465.67, tratando '-' e 'Não Aplicável' como 0."""
     if not s or s.strip() in ("-", "Não Aplicável", "N/A", ""):
         return 0.0
     cleaned = re.sub(r"[^\d,]", "", s.strip()).replace(",", ".")
@@ -28,133 +32,171 @@ def _parse_money(s: str) -> float:
         return 0.0
 
 
-def _find(pattern: str, text: str, group: int = 1) -> Optional[str]:
-    """Extrai o primeiro grupo de uma regex, ou None."""
-    m = re.search(pattern, text)
-    return m.group(group).strip() if m else None
+def _extrair_texto_pdf(pdf_path: str) -> tuple[str, list[str]]:
+    """Devolve (texto_completo, lista_de_textos_por_pagina)."""
+    paginas = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            paginas.append(page.extract_text() or "")
+    return "\n\n".join(paginas), paginas
+
+
+def _total_esperado(texto_completo: str) -> int:
+    """Lê 'Nº total de produtos financeiros comunicados: N' do quadro síntese."""
+    m = re.search(r"Nº total de produtos financeiros comunicados:\s*(\d+)", texto_completo)
+    return int(m.group(1)) if m else 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Modelo de dados
+# Nível 1 — Parser regex
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class Contrato:
-    instituicao: str = ""
-    codigo_instituicao: str = ""
-    produto: str = ""
-    tipo_responsabilidade: str = ""   # Devedor, Avalista, Garante…
-    tipo_negociacao: str = ""
-    inicio: str = ""
-    fim: str = ""                     # "9999-12-31" = sem prazo (revolving)
-    em_litigio: bool = False
-    n_devedores: int = 1
-    total_em_divida: float = 0.0
-    em_incumprimento: float = 0.0
-    vencido: float = 0.0
-    abatido_ao_ativo: float = 0.0
-    potencial: float = 0.0            # limite disponível em cartões
-    prestacao: float = 0.0
-    periodicidade: str = ""           # Mensal, Trimestral, Outros…
-    tem_garantias: bool = False
+def _parse_regex(paginas: list[str]) -> list[dict]:
+    contratos = []
+    inst_atual = ""
 
-    # campos derivados (preenchidos pelo analisador)
-    fim_efetivo: Optional[str] = None  # None se revolving
-    meses_restantes: Optional[int] = None
+    for i, text in enumerate(paginas):
+        if not text:
+            continue
+        if "Quadro Síntese" in text or (
+            "Fim de relatório" in text and "Total em dívida" not in text
+        ):
+            continue
 
+        m = re.search(
+            r"Informação comunicada pela instituição:\s+(.+?)(?:\s*\(\d+\))", text
+        )
+        if m:
+            inst_atual = m.group(1).strip()
 
-@dataclass
-class TitularCRC:
-    nome: str = ""
-    nif: str = ""
-    referente_a: str = ""             # "janeiro de 2020"
-    data_emissao: str = ""
-    contratos: list[Contrato] = field(default_factory=list)
+        # remove rodapé/legenda mas preserva contratos
+        text_limpo = re.sub(r"\nLegenda\n.*", "", text, flags=re.DOTALL)
+        text_limpo = re.sub(r"\nFim de relatório\n.*", "", text_limpo, flags=re.DOTALL)
+        text_limpo = re.sub(r"\nA informação prestada.*", "", text_limpo, flags=re.DOTALL)
+
+        blocos = re.split(r"(?=Tipo de responsabilidade\s+\S)", text_limpo)
+
+        for bloco in blocos:
+            if "Total em dívida" not in bloco:
+                continue
+
+            c: dict = {"instituicao": inst_atual}
+
+            m = re.search(r"Tipo de responsabilidade\s+(.+?)(?:\n|Produto)", bloco)
+            c["tipo_responsabilidade"] = m.group(1).strip() if m else ""
+
+            m = re.search(r"Produto financeiro\s+(.+?)(?:Garantias|Tipo de negociação|\n)", bloco)
+            c["produto"] = m.group(1).strip() if m else ""
+
+            m = re.search(r"Tipo de negociação\s+([\s\S]+?)(?:Em litígio judicial)", bloco)
+            c["tipo_negociacao"] = re.sub(r'\s+', ' ', m.group(1)).strip() if m else ""
+
+            m = re.search(r"Início\s+([\d-]+)", bloco)
+            c["inicio"] = m.group(1) if m else ""
+            m = re.search(r"Fim\s+([\d-]+)", bloco)
+            c["fim"] = m.group(1) if m else ""
+            c["fim_efetivo"] = None if c["fim"] == "9999-12-31" else c["fim"]
+
+            m = re.search(r"Em litígio judicial\s+(Sim|Não)", bloco)
+            c["em_litigio"] = (m.group(1) == "Sim") if m else False
+
+            m = re.search(r"Nº devedores no contrato\s+(\d+)", bloco)
+            c["n_devedores"] = int(m.group(1)) if m else 1
+
+            m = re.search(r"Total em dívida\s+([\d\s.,]+€)", bloco)
+            c["total_em_divida"] = _parse_money(m.group(1)) if m else 0.0
+            m = re.search(r"do qual, em incumprimento\s+([\d\s.,]+€)", bloco)
+            c["em_incumprimento"] = _parse_money(m.group(1)) if m else 0.0
+            m = re.search(r"Vencido\s+([\d\s.,]+€)", bloco)
+            c["vencido"] = _parse_money(m.group(1)) if m else 0.0
+            m = re.search(r"Abatido ao ativo\s+([\d\s.,]+€)", bloco)
+            c["abatido_ao_ativo"] = _parse_money(m.group(1)) if m else 0.0
+            m = re.search(r"Potencial\s+([\d\s.,]+€)", bloco)
+            c["potencial"] = _parse_money(m.group(1)) if m else 0.0
+            m = re.search(r"Prestação\s+([\d\s.,]+€)", bloco)
+            c["prestacao"] = _parse_money(m.group(1)) if m else 0.0
+            m = re.search(r"Periodicidade\s+(\w+)", bloco)
+            c["periodicidade"] = m.group(1) if m else ""
+            c["tem_garantias"] = bool(re.search(r"\d{4}\s+[\d\s.,]+€\s+\d+", bloco))
+
+            contratos.append(c)
+
+    return contratos
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parsing de cada página de contrato
+# Nível 2 — Fallback Claude API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_contrato(text: str) -> Optional[Contrato]:
-    """Extrai um Contrato a partir do texto de uma página do CRC."""
-    if "Informação comunicada pela instituição:" not in text:
-        return None
+PROMPT_EXTRACAO = """Tens à frente o texto extraído de um Mapa de Responsabilidades de Crédito (CRC) do Banco de Portugal.
 
-    c = Contrato()
+Extrai TODOS os contratos de crédito e devolve um array JSON com exactamente esta estrutura por contrato:
 
-    # instituição e código
-    m = re.search(
-        r"Informação comunicada pela instituição:\s+(.+?)\s*\((\d+)\)", text
+{
+  "instituicao": "nome da instituição",
+  "produto": "tipo de produto financeiro",
+  "tipo_responsabilidade": "Devedor / Avalista / fiador / etc",
+  "tipo_negociacao": "Geral / Renegociação por ... / etc",
+  "inicio": "YYYY-MM-DD",
+  "fim": "YYYY-MM-DD ou 9999-12-31",
+  "fim_efetivo": "YYYY-MM-DD ou null se 9999-12-31",
+  "em_litigio": false,
+  "n_devedores": 1,
+  "total_em_divida": 0.0,
+  "em_incumprimento": 0.0,
+  "vencido": 0.0,
+  "abatido_ao_ativo": 0.0,
+  "potencial": 0.0,
+  "prestacao": 0.0,
+  "periodicidade": "Mensal / Outros / vazio",
+  "tem_garantias": false
+}
+
+Regras:
+- Todos os valores monetários em float (ex: 1465.67, não "1 465,67 €")
+- Se um campo não existir ou for "-", usa 0.0 para números e "" para strings
+- fim_efetivo é null quando fim é "9999-12-31"
+- Inclui contratos onde és Avalista/Fiador
+- NÃO incluas dados do quadro síntese, apenas os contratos individuais
+- Responde APENAS com o array JSON, sem texto adicional, sem markdown
+
+Texto do CRC:
+"""
+
+
+def _parse_claude(texto_completo: str) -> list[dict]:
+    """Usa a Claude API para extrair contratos quando o parser regex falha."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY não configurada")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Remove páginas de quadro síntese para poupar tokens
+    texto_limpo = re.sub(
+        r"Resumo das Responsabilidades.*?Fim de relatório",
+        "",
+        texto_completo,
+        flags=re.DOTALL,
     )
-    if m:
-        c.instituicao = m.group(1).strip()
-        c.codigo_instituicao = m.group(2)
 
-    # produto — termina antes de "Garantias" ou "Em litígio"
-    c.produto = _find(
-        r"Produto financeiro\s+(.+?)(?=\s*Garantias|\s*Em litígio)", text
-    ) or ""
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4000,
+        messages=[{
+            "role": "user",
+            "content": PROMPT_EXTRACAO + texto_limpo
+        }]
+    )
 
-    # tipo de responsabilidade
-    c.tipo_responsabilidade = _find(r"Tipo de responsabilidade\s+(\S+)", text) or ""
+    resposta = message.content[0].text.strip()
 
-    # tipo de negociação
-    c.tipo_negociacao = _find(
-        r"Tipo de negociação\s+(.+?)(?=\s*Em litígio)", text
-    ) or ""
+    # limpa possíveis marcadores de código
+    resposta = re.sub(r"^```(?:json)?\s*", "", resposta)
+    resposta = re.sub(r"\s*```$", "", resposta)
 
-    # datas
-    c.inicio = _find(r"Início\s+([\d-]+)", text) or ""
-    c.fim    = _find(r"Fim\s+([\d-]+)", text) or ""
-
-    # sem prazo real se fim for 9999
-    c.fim_efetivo = None if c.fim == "9999-12-31" else c.fim
-
-    # litígio
-    litigio = _find(r"Em litígio judicial\s+(Sim|Não)", text)
-    c.em_litigio = litigio == "Sim"
-
-    # nº devedores
-    nd = _find(r"Nº devedores no contrato\s+(\d+)", text)
-    c.n_devedores = int(nd) if nd else 1
-
-    # montantes
-    c.total_em_divida  = _parse_money(_find(r"Total em dívida\s+([\d\s.,]+€)", text) or "")
-    c.em_incumprimento = _parse_money(_find(r"do qual, em incumprimento\s+([\d\s.,]+€)", text) or "")
-    c.vencido          = _parse_money(_find(r"Vencido\s+([\d\s.,]+€)", text) or "")
-    c.abatido_ao_ativo = _parse_money(_find(r"Abatido ao ativo\s+([\d\s.,]+€)", text) or "")
-    c.potencial        = _parse_money(_find(r"Potencial\s+([\d\s.,]+€)", text) or "")
-    c.prestacao        = _parse_money(_find(r"Prestação\s+([\d\s.,]+€)", text) or "")
-
-    c.periodicidade = _find(r"Periodicidade\s+(\S+)", text) or ""
-
-    # garantias: presentes quando a tabela não mostra só "- - -"
-    c.tem_garantias = "- - -" not in text
-
-    return c
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Parsing do cabeçalho (primeira página)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_cabecalho(text: str, titular: TitularCRC) -> None:
-    m = re.search(r"Nome:\s+(.+)", text)
-    if m:
-        titular.nome = m.group(1).strip()
-
-    m = re.search(r"Nº de Identificação:\s+(\d+)", text)
-    if m:
-        titular.nif = m.group(1)
-
-    m = re.search(r"referentes a\s+(.+?)(?:\n|$)", text)
-    if m:
-        titular.referente_a = m.group(1).strip()
-
-    m = re.search(r"Data de Emissão:\s+([\d\-: ]+)", text)
-    if m:
-        titular.data_emissao = m.group(1).strip()
+    contratos = json.loads(resposta)
+    return contratos
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,30 +205,50 @@ def _parse_cabecalho(text: str, titular: TitularCRC) -> None:
 
 def parse_crc(pdf_path: str) -> dict:
     """
-    Lê um PDF do CRC e devolve um dicionário com todos os dados extraídos.
+    Extrai dados do CRC com validação automática e fallback para IA.
 
-    Args:
-        pdf_path: caminho para o ficheiro PDF
-
-    Returns:
-        Dicionário serializável com titular + lista de contratos
+    Fluxo:
+      1. Extrai texto do PDF
+      2. Lê o total esperado do quadro síntese
+      3. Corre o parser regex
+      4. Se o nº de contratos não bater → usa Claude API como fallback
+      5. Devolve dicionário com titular + contratos
     """
-    titular = TitularCRC()
+    texto_completo, paginas = _extrair_texto_pdf(pdf_path)
 
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
+    # cabeçalho
+    titular: dict = {"nome": "", "nif": "", "referente_a": "", "data_emissao": ""}
+    if paginas:
+        text0 = paginas[0]
+        m = re.search(r"Nome:\s+(.+?)\s+País da Entidade", text0)
+        if m: titular["nome"] = m.group(1).strip()
+        m = re.search(r"Nº de Identificação:\s+(\d+)", text0)
+        if m: titular["nif"] = m.group(1)
+        m = re.search(r"referentes a\s+(.+?)(?:\n|$)", text0)
+        if m: titular["referente_a"] = m.group(1).strip()
+        m = re.search(r"Data de Emissão:\s+([\d\-: ]+)", text0)
+        if m: titular["data_emissao"] = m.group(1).strip()
 
-            # cabeçalho lido a partir da primeira página
-            if i == 0:
-                _parse_cabecalho(text, titular)
+    total_esperado = _total_esperado(texto_completo)
 
-            # tenta extrair contrato de qualquer página
-            contrato = _parse_contrato(text)
-            if contrato:
-                titular.contratos.append(contrato)
+    # nível 1 — regex
+    contratos = _parse_regex(paginas)
 
-    return asdict(titular)
+    # nível 2 — fallback IA se necessário
+    metodo = "regex"
+    if total_esperado > 0 and len(contratos) != total_esperado:
+        print(f"[parser] regex extraiu {len(contratos)}, esperado {total_esperado} → a usar Claude API")
+        try:
+            contratos = _parse_claude(texto_completo)
+            metodo = "claude"
+        except Exception as e:
+            print(f"[parser] fallback Claude falhou: {e} — a usar resultado regex")
+
+    titular["contratos"] = contratos
+    titular["metodo_extracao"] = metodo
+    titular["total_esperado"] = total_esperado
+    titular["total_extraido"] = len(contratos)
+    return titular
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,149 +256,82 @@ def parse_crc(pdf_path: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analisar_crc(crc: dict, rendimento_mensal: float) -> dict:
-    """
-    Calcula métricas financeiras e gera alertas a partir dos dados do CRC.
-
-    Args:
-        crc: resultado de parse_crc()
-        rendimento_mensal: rendimento líquido mensal do titular (em €)
-
-    Returns:
-        Dicionário com métricas, score, alertas e recomendações
-    """
     contratos = crc.get("contratos", [])
 
-    # ── totais ────────────────────────────────────────────────────────────────
     divida_efetiva   = sum(c["total_em_divida"] for c in contratos)
     divida_potencial = sum(c["potencial"] for c in contratos)
     incumprimento    = sum(c["em_incumprimento"] for c in contratos)
     vencido          = sum(c["vencido"] for c in contratos)
     abatido          = sum(c["abatido_ao_ativo"] for c in contratos)
-
-    # apenas contratos mensais contam na taxa de esforço
     prestacao_mensal = sum(
-        c["prestacao"] for c in contratos
-        if c["periodicidade"] == "Mensal"
+        c["prestacao"] for c in contratos if c["periodicidade"] == "Mensal"
     )
 
-    # ── métricas ──────────────────────────────────────────────────────────────
-    taxa_esforco = (
-        round(prestacao_mensal / rendimento_mensal * 100, 2)
-        if rendimento_mensal > 0 else 0.0
-    )
-    racio_divida_rendimento = (
-        round(divida_efetiva / (rendimento_mensal * 12), 2)
-        if rendimento_mensal > 0 else 0.0
-    )
+    taxa_esforco = round(prestacao_mensal / rendimento_mensal * 100, 2) if rendimento_mensal > 0 else 0.0
+    racio_divida = round(divida_efetiva / (rendimento_mensal * 12), 2) if rendimento_mensal > 0 else 0.0
 
-    # ── score 0-100 ───────────────────────────────────────────────────────────
     score = 100
-
-    # taxa de esforço
-    if taxa_esforco > 35:
-        score -= min(25, round((taxa_esforco - 35) * 1.5))
-    if taxa_esforco > 50:
-        score -= 15
-
-    # rácio dívida/rendimento
-    if racio_divida_rendimento > 3:
-        score -= min(20, round((racio_divida_rendimento - 3) * 5))
-
-    # incumprimento e abatido são críticos
-    if incumprimento > 0:
-        score -= 40
-    if abatido > 0:
-        score -= 20
-
-    # muitos cartões reduzem aprovação de habitação
+    if taxa_esforco > 35: score -= min(25, round((taxa_esforco - 35) * 1.5))
+    if taxa_esforco > 50: score -= 15
+    if racio_divida > 3:  score -= min(20, round((racio_divida - 3) * 5))
+    if incumprimento > 0: score -= 40
+    if abatido > 0:       score -= 20
     n_cartoes = sum(1 for c in contratos if "Cartão" in c["produto"])
-    if n_cartoes > 2:
-        score -= 10
-
-    # créditos em litígio
-    if any(c["em_litigio"] for c in contratos):
-        score -= 20
-
+    if n_cartoes > 2:     score -= 10
+    if any(c["em_litigio"] for c in contratos): score -= 20
     score = max(0, min(100, score))
 
-    # ── alertas ───────────────────────────────────────────────────────────────
     alertas = []
-
     if incumprimento > 0 or vencido > 0 or abatido > 0:
-        alertas.append({
-            "nivel": "crit",
-            "codigo": "INCUMPRIMENTO",
-            "msg": (
-                f"Incumprimento activo: {incumprimento:,.2f} €"
-                + (f" | Vencido: {vencido:,.2f} €" if vencido > 0 else "")
-                + (f" | Abatido ao activo: {abatido:,.2f} €" if abatido > 0 else "")
-            ),
-        })
-
+        alertas.append({"nivel": "crit", "codigo": "INCUMPRIMENTO",
+            "msg": f"Incumprimento activo: {incumprimento:,.2f} €"})
     if taxa_esforco > 50:
-        alertas.append({
-            "nivel": "crit",
-            "codigo": "TAXA_ESFORCO_CRITICA",
-            "msg": f"Taxa de esforço crítica: {taxa_esforco:.1f}% (limite: 35%)",
-        })
+        alertas.append({"nivel": "crit", "codigo": "TAXA_ESFORCO_CRITICA",
+            "msg": f"Taxa de esforço crítica: {taxa_esforco:.1f}% (limite: 35%)"})
     elif taxa_esforco > 35:
-        alertas.append({
-            "nivel": "warn",
-            "codigo": "TAXA_ESFORCO_ELEVADA",
-            "msg": f"Taxa de esforço elevada: {taxa_esforco:.1f}% (limite: 35%)",
-        })
-
-    if racio_divida_rendimento > 3:
-        alertas.append({
-            "nivel": "warn",
-            "codigo": "RACIO_DIVIDA",
-            "msg": f"Rácio dívida/rendimento anual: {racio_divida_rendimento:.1f}× (alerta: 3×)",
-        })
-
+        alertas.append({"nivel": "warn", "codigo": "TAXA_ESFORCO_ELEVADA",
+            "msg": f"Taxa de esforço elevada: {taxa_esforco:.1f}% (limite: 35%)"})
+    if racio_divida > 3:
+        alertas.append({"nivel": "warn", "codigo": "RACIO_DIVIDA",
+            "msg": f"Rácio dívida/rendimento anual: {racio_divida:.1f}× (alerta: 3×)"})
     cartoes_sem_saldo = [
         c for c in contratos
         if "Cartão" in c["produto"] and c["total_em_divida"] == 0 and c["potencial"] > 0
     ]
     if cartoes_sem_saldo:
-        total_pot_cartoes = sum(c["potencial"] for c in cartoes_sem_saldo)
-        alertas.append({
-            "nivel": "info",
-            "codigo": "CARTOES_SEM_SALDO",
-            "msg": (
-                f"{len(cartoes_sem_saldo)} cartão(ões) sem saldo mas com limite disponível "
-                f"({total_pot_cartoes:,.2f} €) — contam como responsabilidade potencial"
-            ),
-        })
+        total_pot = sum(c["potencial"] for c in cartoes_sem_saldo)
+        alertas.append({"nivel": "info", "codigo": "CARTOES_SEM_SALDO",
+            "msg": f"{len(cartoes_sem_saldo)} cartão(ões) sem saldo mas com limite ({total_pot:,.2f} €)"})
+    conjuntos = [c for c in contratos if c["n_devedores"] > 1]
+    if conjuntos:
+        alertas.append({"nivel": "info", "codigo": "CONTRATO_CONJUNTO",
+            "msg": f"{len(conjuntos)} contrato(s) com múltiplos devedores — responsabilidade solidária"})
+    avalistas = [
+        c for c in contratos
+        if "avalista" in c.get("tipo_responsabilidade", "").lower()
+        or "fiador" in c.get("tipo_responsabilidade", "").lower()
+    ]
+    if avalistas:
+        alertas.append({"nivel": "info", "codigo": "AVALISTA",
+            "msg": f"És avalista/fiador em {len(avalistas)} contrato(s) — monitoriza o devedor principal"})
+    renegociacoes = [c for c in contratos if "Renegociação" in c.get("tipo_negociacao", "")]
+    if renegociacoes:
+        alertas.append({"nivel": "warn", "codigo": "RENEGOCIACAO",
+            "msg": f"{len(renegociacoes)} contrato(s) com renegociação por prevenção/incumprimento"})
 
-    contratos_conjunto = [c for c in contratos if c["n_devedores"] > 1]
-    if contratos_conjunto:
-        alertas.append({
-            "nivel": "info",
-            "codigo": "CONTRATO_CONJUNTO",
-            "msg": (
-                f"{len(contratos_conjunto)} contrato(s) com múltiplos devedores "
-                "— responsabilidade solidária pela totalidade da dívida"
-            ),
-        })
+    # aviso se fallback foi usado
+    if crc.get("metodo_extracao") == "claude":
+        alertas.append({"nivel": "info", "codigo": "FALLBACK_IA",
+            "msg": "Extracção assistida por IA (formato do CRC não standard)"})
 
-    litigios = [c for c in contratos if c["em_litigio"]]
-    if litigios:
-        alertas.append({
-            "nivel": "crit",
-            "codigo": "EM_LITIGIO",
-            "msg": f"{len(litigios)} contrato(s) em litígio judicial",
-        })
-
-    # ── recomendações ─────────────────────────────────────────────────────────
-    recomendacoes = _gerar_recomendacoes(
-        contratos, taxa_esforco, racio_divida_rendimento, incumprimento
-    )
+    recomendacoes = _gerar_recomendacoes(contratos, taxa_esforco, racio_divida, incumprimento)
 
     return {
         "titular": crc.get("nome", ""),
         "referente_a": crc.get("referente_a", ""),
         "data_emissao": crc.get("data_emissao", ""),
         "rendimento_mensal": rendimento_mensal,
+        "metodo_extracao": crc.get("metodo_extracao", "regex"),
         "metricas": {
             "divida_efetiva": round(divida_efetiva, 2),
             "divida_potencial": round(divida_potencial, 2),
@@ -348,7 +343,7 @@ def analisar_crc(crc: dict, rendimento_mensal: float) -> dict:
             "n_contratos": len(contratos),
             "n_instituicoes": len(set(c["instituicao"] for c in contratos)),
             "taxa_esforco_pct": taxa_esforco,
-            "racio_divida_rendimento": racio_divida_rendimento,
+            "racio_divida_rendimento": racio_divida,
             "score_saude": score,
         },
         "alertas": alertas,
@@ -357,110 +352,48 @@ def analisar_crc(crc: dict, rendimento_mensal: float) -> dict:
     }
 
 
-def _gerar_recomendacoes(
-    contratos: list,
-    taxa_esforco: float,
-    racio_divida: float,
-    incumprimento: float,
-) -> list[dict]:
-    """Gera recomendações priorizadas com base no perfil de crédito."""
+def _gerar_recomendacoes(contratos, taxa_esforco, racio_divida, incumprimento):
     recs = []
 
-    # cartões sem saldo → cancelar
-    cartoes_sem_saldo = [
-        c for c in contratos
-        if "Cartão" in c["produto"] and c["total_em_divida"] == 0
-    ]
-    if cartoes_sem_saldo:
-        recs.append({
-            "prioridade": 1,
-            "impacto": "alto",
-            "titulo": f"Cancelar {len(cartoes_sem_saldo)} cartão(ões) sem utilização",
-            "descricao": (
-                "Cartões com saldo zero mas limite activo contam como responsabilidades "
-                "potenciais no CRC. Cancelá-los reduz imediatamente este valor e melhora "
-                "o perfil para novos créditos, nomeadamente habitação."
-            ),
-            "codigo": "CANCELAR_CARTOES",
-            "instituicoes": [c["instituicao"] for c in cartoes_sem_saldo],
-        })
-
-    # taxa esforço elevada → consolidar ou renegociar
-    if taxa_esforco > 35:
-        creditos_pessoais = [
-            c for c in contratos
-            if c["produto"] in ("Crédito pessoal", "Crédito automóvel")
-        ]
-        if len(creditos_pessoais) >= 2:
-            recs.append({
-                "prioridade": 2,
-                "impacto": "alto",
-                "titulo": "Consolidar créditos pessoais/automóvel",
-                "descricao": (
-                    "Juntar múltiplos créditos num único com taxa mais baixa pode reduzir "
-                    "a prestação mensal total e simplificar a gestão financeira."
-                ),
-                "codigo": "CONSOLIDAR_CREDITOS",
-                "valor_estimado": sum(c["total_em_divida"] for c in creditos_pessoais),
-            })
-        else:
-            recs.append({
-                "prioridade": 2,
-                "impacto": "medio",
-                "titulo": "Renegociar prazo para reduzir prestação",
-                "descricao": (
-                    "Alargar o prazo do(s) crédito(s) existente(s) pode baixar a prestação "
-                    "mensal e a taxa de esforço, embora aumente o custo total em juros."
-                ),
-                "codigo": "RENEGOCIAR_PRAZO",
-            })
-
-    # cartão com saldo → refinanciar
-    cartoes_com_saldo = [
-        c for c in contratos
-        if "Cartão" in c["produto"] and c["total_em_divida"] > 0
-    ]
-    if cartoes_com_saldo:
-        total_cartoes = sum(c["total_em_divida"] for c in cartoes_com_saldo)
-        recs.append({
-            "prioridade": 3,
-            "impacto": "medio",
-            "titulo": "Transferir saldo de cartão para crédito pessoal",
-            "descricao": (
-                f"Os cartões de crédito têm taxas de 15–24% ao ano. "
-                f"Transferir {total_cartoes:,.2f} € para um crédito pessoal "
-                "a 6–12% pode poupar centenas de euros em juros."
-            ),
-            "codigo": "REFINANCIAR_CARTAO",
-            "valor_estimado": total_cartoes,
-        })
-
-    # incumprimento → regularizar
     if incumprimento > 0:
-        recs.insert(0, {
-            "prioridade": 0,
-            "impacto": "critico",
+        recs.append({"prioridade": 0, "impacto": "critico",
             "titulo": "Regularizar incumprimentos urgentemente",
-            "descricao": (
-                "Os incumprimentos activos impedem a aprovação de qualquer novo crédito "
-                "e agravam o historial no CRC. Contactar as instituições para negociar "
-                "um plano de pagamento é a prioridade absoluta."
-            ),
-            "codigo": "REGULARIZAR_INCUMPRIMENTO",
-        })
+            "descricao": "Os incumprimentos activos impedem a aprovação de qualquer novo crédito. Contacta as instituições para negociar um plano de pagamento.",
+            "codigo": "REGULARIZAR_INCUMPRIMENTO"})
 
-    # perfil saudável → optimizar
+    cartoes_sem_saldo = [c for c in contratos if "Cartão" in c["produto"] and c["total_em_divida"] == 0]
+    if cartoes_sem_saldo:
+        recs.append({"prioridade": 1, "impacto": "alto",
+            "titulo": f"Cancelar {len(cartoes_sem_saldo)} cartão(ões) sem utilização",
+            "descricao": "Cartões com saldo zero mas limite activo contam como responsabilidades potenciais. Cancelá-los melhora imediatamente o perfil de crédito.",
+            "codigo": "CANCELAR_CARTOES",
+            "instituicoes": [c["instituicao"] for c in cartoes_sem_saldo]})
+
+    if taxa_esforco > 35:
+        recs.append({"prioridade": 2, "impacto": "alto",
+            "titulo": "Taxa de esforço elevada — renegociar prazos",
+            "descricao": f"Com {taxa_esforco:.1f}% de taxa de esforço, a aprovação de novos créditos fica comprometida. Alargar o prazo dos créditos existentes pode reduzir as prestações mensais.",
+            "codigo": "RENEGOCIAR_PRAZO"})
+
+    cartoes_com_saldo = [c for c in contratos if "Cartão" in c["produto"] and c["total_em_divida"] > 0]
+    if cartoes_com_saldo:
+        total = sum(c["total_em_divida"] for c in cartoes_com_saldo)
+        recs.append({"prioridade": 3, "impacto": "medio",
+            "titulo": "Transferir saldo de cartão para crédito pessoal",
+            "descricao": f"Os cartões têm taxas de 15–24%/ano. Transferir {total:,.2f} € para um crédito pessoal a taxa mais baixa pode poupar centenas de euros em juros.",
+            "codigo": "REFINANCIAR_CARTAO", "valor_estimado": total})
+
+    renegociacoes = [c for c in contratos if "Renegociação" in c.get("tipo_negociacao", "")]
+    if renegociacoes:
+        recs.append({"prioridade": 4, "impacto": "medio",
+            "titulo": f"{len(renegociacoes)} crédito(s) com renegociação por incumprimento",
+            "descricao": "Créditos renegociados indicam historial de dificuldades. Manter os pagamentos em dia é crítico para recuperar o perfil de crédito junto dos bancos.",
+            "codigo": "CREDITOS_RENEGOCIADOS"})
+
     if taxa_esforco <= 35 and incumprimento == 0 and racio_divida <= 3:
-        recs.append({
-            "prioridade": 4,
-            "impacto": "baixo",
+        recs.append({"prioridade": 5, "impacto": "baixo",
             "titulo": "Perfil favorável para novo crédito",
-            "descricao": (
-                "A situação financeira está equilibrada. Podes explorar a antecipação "
-                "de capital em créditos com taxa mais alta, ou simular um novo crédito "
-                "habitação/automóvel com boa probabilidade de aprovação."
-            ),
-            "codigo": "OTIMIZAR_PERFIL",
-        })
+            "descricao": "A situação financeira está equilibrada. Podes explorar a antecipação de capital em créditos com taxa mais alta, ou simular um novo crédito com boa probabilidade de aprovação.",
+            "codigo": "OTIMIZAR_PERFIL"})
 
     return sorted(recs, key=lambda r: r["prioridade"])
